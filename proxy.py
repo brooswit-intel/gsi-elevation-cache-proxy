@@ -205,11 +205,23 @@ def _is_well_formed_png(body: bytes) -> bool:
     return body.startswith(PNG_SIGNATURE) and body.rstrip().endswith(b"IEND\xaeB`\x82")
 
 
-def fetch_upstream(upstream_base: str, tile_path: str, timeout: float = 10.0, retries: int = 3):
+#: generous bound for an error/non-tile body we only need to classify, not use.
+_DRAIN_CAP = 4096
+
+
+def fetch_upstream(upstream_base: str, tile_path: str, timeout: float = 10.0, retries: int = 3, max_response_bytes: int = MAX_BYTES):
     """GET with the same Range window the mod itself sends. Returns
     ("ok", body) for 200/206 with a well-formed PNG, ("negative", None) for a
     genuine 404/403, and raises UpstreamError for anything else (including a
-    structurally invalid "success")."""
+    structurally invalid "success").
+
+    Status is checked BEFORE any body is read, and every read is capped
+    (`max_response_bytes` for a claimed success, `_DRAIN_CAP` otherwise) --
+    never an unbounded `resp.read()`. An origin that ignores Range and tries
+    to answer with something far larger than expected is read only up to the
+    cap, found truncated/oversized by the length check below, and rejected
+    -- it is never allowed to force an unbounded download before that
+    rejection happens."""
     parsed = urllib.parse.urlsplit(upstream_base)
     full_path = parsed.path.rstrip("/") + "/" + tile_path
     last_exc: Exception | None = None
@@ -228,11 +240,16 @@ def fetch_upstream(upstream_base: str, tile_path: str, timeout: float = 10.0, re
                 },
             )
             resp = conn.getresponse()
-            body = resp.read()
             if resp.status in (404, 403):
+                resp.read(_DRAIN_CAP)
                 return "negative", None
             if resp.status not in (200, 206):
                 last_exc = UpstreamError(f"HTTP {resp.status} for {full_path}")
+                resp.read(_DRAIN_CAP)
+                continue
+            body = resp.read(max_response_bytes + 1)
+            if len(body) > max_response_bytes:
+                last_exc = UpstreamError(f"response exceeded the {max_response_bytes}-byte cap for {full_path} (origin may be ignoring Range)")
                 continue
             declared = resp.getheader("Content-Length")
             if declared is not None and int(declared) != len(body):
@@ -351,17 +368,23 @@ class GsiCacheProxy:
     #: a representative in-coverage tile the health probe uses - any valid tile works.
     HEALTH_PROBE_TILE = "dem_png/14/14552/6451.png"
 
+    #: a real GSI DEM tile this size is comfortably over any real one; still far below MAX_BYTES,
+    #: so a misbehaving/wrong origin that ignores Range can't force a large read off this probe.
+    HEALTH_PROBE_CAP = 256 * 1024
+
     def health_check(self) -> tuple[int, dict]:
         """The dedicated upstream health-check endpoint (/__health): TTL 0, always a fresh
         live probe against the real upstream, never reads or writes the tile cache in either
         direction. Reflects upstream reachability only, independent of EarthStatus's separate
         plain-HEAD probe contract and HostBackoff's own Range recovery probe against an
         ordinary tile URI -- both of those exercise the normal cache (TTL -1) on purpose; this
-        one deliberately never does."""
+        one deliberately never does. Status is validated before any body is read, and the read
+        itself is capped at HEALTH_PROBE_CAP -- tiny relative to the ordinary MAX_BYTES bound --
+        so a probe can never be tricked into an unbounded download."""
         with self.stats.lock:
             self.stats.probe_requests += 1
         try:
-            outcome, _ = fetch_upstream(self.upstream_base, self.HEALTH_PROBE_TILE)
+            outcome, _ = fetch_upstream(self.upstream_base, self.HEALTH_PROBE_TILE, max_response_bytes=self.HEALTH_PROBE_CAP)
             if outcome != "ok":
                 raise UpstreamError(f"health probe tile {self.HEALTH_PROBE_TILE} answered negative")
             return 200, {}

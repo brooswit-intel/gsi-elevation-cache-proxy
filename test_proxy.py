@@ -19,7 +19,8 @@ MINIMAL_PNG = (
 
 class FakeUpstream(BaseHTTPRequestHandler):
     """Stands in for cyberjapandata.gsi.go.jp: serves one real tile, one
-    malformed-but-200 tile, one that drops the connection, and 404s the rest."""
+    malformed-but-200 tile, one that drops the connection, one that ignores
+    Range and sends far more than expected, and 404s the rest."""
 
     hits = []
 
@@ -36,6 +37,13 @@ class FakeUpstream(BaseHTTPRequestHandler):
         elif self.path == "/dem_png/14/300/300.png":
             self.close_connection = True
             return  # dropped connection -> client-side OSError
+        elif self.path == "/dem_png/14/400/400.png":
+            # Ignores Range entirely and answers with more than the Range window allows.
+            body = MINIMAL_PNG + b"\x00" * (gsi.MAX_BYTES + 4096)
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
         else:
             body = b"<Error><Code>NoSuchKey</Code></Error>"
             self.send_response(404)
@@ -126,6 +134,11 @@ class ProxyTest(unittest.TestCase):
         resp, _ = self._get("/dem_png/14/300/300.png")
         self.assertEqual(resp.status, 502)
         self.assertIsNone(self.proxy.cache.get("dem_png/14/300/300.png"))
+
+    def test_origin_ignoring_range_is_rejected_not_downloaded_unbounded(self):
+        resp, _ = self._get("/dem_png/14/400/400.png")
+        self.assertEqual(resp.status, 502)
+        self.assertIsNone(self.proxy.cache.get("dem_png/14/400/400.png"))
 
     def test_range_request_served_as_206_slice(self):
         self._get("/dem_png/14/100/100.png")
