@@ -81,6 +81,8 @@ class Stats:
     not_modified: int = 0
     bytes_downloaded: int = 0
     evictions: int = 0
+    probe_requests: int = 0
+    probe_failures: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def as_dict(self) -> dict:
@@ -93,6 +95,8 @@ class Stats:
                 "not_modified": self.not_modified,
                 "bytes_downloaded": self.bytes_downloaded,
                 "evictions": self.evictions,
+                "probe_requests": self.probe_requests,
+                "probe_failures": self.probe_failures,
             }
 
 
@@ -344,6 +348,28 @@ class GsiCacheProxy:
         tile_path = parse_tile_path(request_path)
         return False if tile_path is None else self.cache.invalidate(tile_path)
 
+    #: a representative in-coverage tile the health probe uses - any valid tile works.
+    HEALTH_PROBE_TILE = "dem_png/14/14552/6451.png"
+
+    def health_check(self) -> tuple[int, dict]:
+        """The dedicated upstream health-check endpoint (/__health): TTL 0, always a fresh
+        live probe against the real upstream, never reads or writes the tile cache in either
+        direction. Reflects upstream reachability only, independent of EarthStatus's separate
+        plain-HEAD probe contract and HostBackoff's own Range recovery probe against an
+        ordinary tile URI -- both of those exercise the normal cache (TTL -1) on purpose; this
+        one deliberately never does."""
+        with self.stats.lock:
+            self.stats.probe_requests += 1
+        try:
+            outcome, _ = fetch_upstream(self.upstream_base, self.HEALTH_PROBE_TILE)
+            if outcome != "ok":
+                raise UpstreamError(f"health probe tile {self.HEALTH_PROBE_TILE} answered negative")
+            return 200, {}
+        except UpstreamError:
+            with self.stats.lock:
+                self.stats.probe_failures += 1
+            return 502, {}
+
     def close(self):
         self.cache.close()
 
@@ -354,27 +380,40 @@ def make_handler(proxy: GsiCacheProxy):
             pass
 
         def do_GET(self):
+            self._dispatch(write_body=True)
+
+        def do_HEAD(self):
+            # No method-based special-casing on the ordinary tile resource: a HEAD gets exactly
+            # the headers/status a GET would, through the normal TTL -1 cache, same as GET. The
+            # dedicated /__health endpoint below is the TTL-0 live-reachability probe.
+            self._dispatch(write_body=False)
+
+        def _dispatch(self, write_body):
             if self.path == "/__stats":
                 import json
                 payload = json.dumps(proxy.stats.as_dict()).encode()
-                self._respond(200, {"Content-Type": "application/json"}, payload)
+                self._respond(200, {"Content-Type": "application/json"}, payload, write_body)
+                return
+            if self.path == "/__health":
+                status, headers = proxy.health_check()
+                self._respond(status, headers, b"", write_body)
                 return
             status, headers, body = proxy.serve_tile(self.path, self.headers.get("If-None-Match"), self.headers.get("Range"))
-            self._respond(status, headers, body)
+            self._respond(status, headers, body, write_body)
 
         def do_DELETE(self):
             # Explicit invalidation: John's TTL -1 decision still requires a
             # way to force a re-fetch after a known upstream data revision.
             removed = proxy.invalidate(self.path)
-            self._respond(200 if removed else 404, {}, b"")
+            self._respond(200 if removed else 404, {}, b"", write_body=True)
 
-        def _respond(self, status, headers, body):
+        def _respond(self, status, headers, body, write_body=True):
             self.send_response(status)
             for key, value in headers.items():
                 self.send_header(key, value)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
-            if body:
+            if write_body and body:
                 self.wfile.write(body)
 
     return Handler

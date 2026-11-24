@@ -228,6 +228,41 @@ class ProxyTest(unittest.TestCase):
             finally:
                 proxy.close()
 
+    def test_health_endpoint_is_fresh_and_bypasses_the_tile_cache(self):
+        with mock.patch.object(gsi.GsiCacheProxy, "HEALTH_PROBE_TILE", "dem_png/14/100/100.png"):
+            # Prime the ordinary cache so a stale hit there can't masquerade as a live probe.
+            self._get("/dem_png/14/100/100.png")
+            hits_before = len(FakeUpstream.hits)
+
+            resp, body = self._get("/__health")
+            self.assertEqual(resp.status, 200)
+            self.assertEqual(body, b"")
+            self.assertEqual(len(FakeUpstream.hits), hits_before + 1, "/__health must always hit upstream fresh, never the tile cache")
+
+            resp2, _ = self._get("/__health")
+            self.assertEqual(resp2.status, 200)
+            self.assertEqual(len(FakeUpstream.hits), hits_before + 2, "a second /__health call must probe again, not reuse the first result")
+            self.assertEqual(self.proxy.stats.as_dict()["probe_requests"], 2)
+
+    def test_health_endpoint_reports_failure_without_poisoning_tile_cache(self):
+        with mock.patch.object(gsi.GsiCacheProxy, "HEALTH_PROBE_TILE", "dem_png/14/999/999.png"):
+            resp, _ = self._get("/__health")
+            self.assertEqual(resp.status, 502)
+            self.assertEqual(self.proxy.stats.as_dict()["probe_failures"], 1)
+        # The failed probe must not have written a negative result into the ordinary tile cache.
+        self.assertIsNone(self.proxy.cache.get("dem_png/14/999/999.png"))
+
+    def test_head_on_ordinary_tile_goes_through_the_normal_cache(self):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=15)
+        conn.request("HEAD", "/dem_png/14/100/100.png")
+        resp = conn.getresponse()
+        body = resp.read()
+        conn.close()
+        self.assertEqual(resp.status, 200)
+        self.assertEqual(body, b"")  # HEAD never carries a body
+        self.assertEqual(resp.getheader("Content-Length"), str(len(MINIMAL_PNG)))
+        self.assertEqual(len(FakeUpstream.hits), 1, "a HEAD on a tile must still go through (and populate) the ordinary cache")
+
 
 if __name__ == "__main__":
     unittest.main()

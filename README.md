@@ -33,10 +33,9 @@ python3 proxy.py                      # serves on 127.0.0.1:8074 by default
   the byte cap/LRU eviction below, and `DELETE /{path}` explicitly
   invalidates one entry. A genuine negative (upstream 404/403, "no tile
   here") is cached the same way, distinguishable on disk from a real 0-byte
-  response. There is no dedicated upstream health-check resource for this
-  source (unlike Terrarium's separate `EarthStatus` HEAD probe) -- ordinary
-  tile GETs are the only upstream traffic, so the separate TTL-0-health-check
-  rule has nothing to apply to here.
+  response. The dedicated `/__health` endpoint below is the separate TTL-0
+  resource this decision's health-check exception applies to -- ordinary
+  tile requests stay TTL -1.
 - Range requests served as 206 slices of the cached object; a stable
   SHA-256 ETag supports `If-None-Match` -> 304. Matches the mod's own
   `RangeFiles.fetch()`, which always requests `Range: bytes=0-4194303` and
@@ -50,6 +49,14 @@ python3 proxy.py                      # serves on 127.0.0.1:8074 by default
 - Concurrent cache misses for the same tile single-flight to exactly one
   upstream request.
 - Bounded storage: `max_bytes`, LRU eviction down to 90% on overflow.
+- Dedicated `/__health` endpoint (HEAD or GET): a fresh, uncached, TTL-0 live
+  probe against the real upstream -- 200 on success, 502 on failure -- that
+  never reads or writes the ordinary tile cache in either direction. Matches
+  the contract established across the other Earth Platform proxy lanes
+  (elevation-cache-proxy, eox-imagery-cache-proxy) for the mod's configured-
+  proxy reachability checks. An ordinary `HEAD` on a real tile path is
+  unaffected: it goes through the normal TTL -1 cache, identically to `GET`
+  minus the body.
 
 ## Live verification (read-only, 2026-11-24, no caching/mutation)
 
