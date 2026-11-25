@@ -208,7 +208,20 @@ def _is_well_formed_png(body: bytes) -> bool:
 #: generous bound for an error/non-tile body we only need to classify, not use.
 _DRAIN_CAP = 4096
 
-_CONTENT_RANGE_RE = re.compile(r"^bytes (\d+)-\d+/\d+$")
+_CONTENT_RANGE_RE = re.compile(r"^bytes (\d+)-(\d+)/\d+$")
+
+
+def _content_range_interval(resp) -> tuple[int, int] | None:
+    """Parses a 206's Content-Range into (start, inclusive_length), or None
+    if it's missing/unparseable."""
+    value = resp.getheader("Content-Range")
+    if value is None:
+        return None
+    m = _CONTENT_RANGE_RE.match(value)
+    if m is None:
+        return None
+    start, end = int(m.group(1)), int(m.group(2))
+    return start, end - start + 1
 
 
 def _content_range_starts_at_zero(resp) -> bool:
@@ -218,11 +231,8 @@ def _content_range_starts_at_zero(resp) -> bool:
     but the wrong offset (observed in the wild on another Earth Platform
     proxy, MINECRAFT-571 55866) would otherwise be written into the cache
     as if it were the tile's own first bytes."""
-    value = resp.getheader("Content-Range")
-    if value is None:
-        return False
-    m = _CONTENT_RANGE_RE.match(value)
-    return m is not None and m.group(1) == "0"
+    interval = _content_range_interval(resp)
+    return interval is not None and interval[0] == 0
 
 
 def fetch_upstream(upstream_base: str, tile_path: str, timeout: float = 10.0, retries: int = 3, max_response_bytes: int = MAX_BYTES):
@@ -275,6 +285,15 @@ def fetch_upstream(upstream_base: str, tile_path: str, timeout: float = 10.0, re
             if declared is not None and int(declared) != len(body):
                 last_exc = UpstreamError(f"truncated transfer for {full_path}: declared {declared}, got {len(body)}")
                 continue
+            if resp.status == 206:
+                # Content-Length alone isn't enough: a short body whose Content-Length
+                # happens to match its own (already-truncated) size, but whose
+                # Content-Range still claims the original, larger interval, must still
+                # be caught (MINECRAFT-571 55874).
+                _, interval_length = _content_range_interval(resp)
+                if interval_length != len(body):
+                    last_exc = UpstreamError(f"206 for {full_path} body length {len(body)} doesn't match its own Content-Range interval {interval_length}")
+                    continue
             if not _is_well_formed_png(body):
                 last_exc = UpstreamError(f"malformed PNG (HTTP {resp.status} but not a valid tile) for {full_path}")
                 continue

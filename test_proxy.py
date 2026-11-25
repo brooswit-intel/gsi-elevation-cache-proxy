@@ -53,6 +53,16 @@ class FakeUpstream(BaseHTTPRequestHandler):
             self.send_header("Content-Range", f"bytes 20-{20 + len(MINIMAL_PNG) - 1}/10000")
             self.end_headers()
             self.wfile.write(MINIMAL_PNG)
+        elif self.path == "/dem_png/14/600/600.png":
+            # 206 claiming a bigger interval (bytes 0-9999) than the body it actually
+            # sends (truncated to len(MINIMAL_PNG)), with Content-Length matching the
+            # truncated body -- the case from MINECRAFT-571 55874.
+            self.send_response(206)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(MINIMAL_PNG)))
+            self.send_header("Content-Range", "bytes 0-9999/10000")
+            self.end_headers()
+            self.wfile.write(MINIMAL_PNG)
         else:
             body = b"<Error><Code>NoSuchKey</Code></Error>"
             self.send_response(404)
@@ -153,6 +163,14 @@ class ProxyTest(unittest.TestCase):
         resp, _ = self._get("/dem_png/14/500/500.png")
         self.assertEqual(resp.status, 502, "a 206 whose Content-Range doesn't start at 0 must never be trusted as this tile's own bytes")
         self.assertIsNone(self.proxy.cache.get("dem_png/14/500/500.png"))
+
+    def test_206_truncated_body_with_matching_content_length_is_rejected(self):
+        # Content-Length matches the (already-truncated) body, but Content-Range's
+        # own interval claims a much larger span -- a short body that lies about
+        # being the whole thing it claims to be must never be cached as success.
+        resp, _ = self._get("/dem_png/14/600/600.png")
+        self.assertEqual(resp.status, 502)
+        self.assertIsNone(self.proxy.cache.get("dem_png/14/600/600.png"))
 
     def test_range_request_served_as_206_slice(self):
         self._get("/dem_png/14/100/100.png")
