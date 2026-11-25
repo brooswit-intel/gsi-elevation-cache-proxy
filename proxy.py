@@ -208,6 +208,22 @@ def _is_well_formed_png(body: bytes) -> bool:
 #: generous bound for an error/non-tile body we only need to classify, not use.
 _DRAIN_CAP = 4096
 
+_CONTENT_RANGE_RE = re.compile(r"^bytes (\d+)-\d+/\d+$")
+
+
+def _content_range_starts_at_zero(resp) -> bool:
+    """Every request here always asks for Range: bytes=0-N. A 206 whose
+    Content-Range doesn't confirm the served bytes actually start at 0 is
+    rejected rather than trusted blind -- a response with the right length
+    but the wrong offset (observed in the wild on another Earth Platform
+    proxy, MINECRAFT-571 55866) would otherwise be written into the cache
+    as if it were the tile's own first bytes."""
+    value = resp.getheader("Content-Range")
+    if value is None:
+        return False
+    m = _CONTENT_RANGE_RE.match(value)
+    return m is not None and m.group(1) == "0"
+
 
 def fetch_upstream(upstream_base: str, tile_path: str, timeout: float = 10.0, retries: int = 3, max_response_bytes: int = MAX_BYTES):
     """GET with the same Range window the mod itself sends. Returns
@@ -245,6 +261,10 @@ def fetch_upstream(upstream_base: str, tile_path: str, timeout: float = 10.0, re
                 return "negative", None
             if resp.status not in (200, 206):
                 last_exc = UpstreamError(f"HTTP {resp.status} for {full_path}")
+                resp.read(_DRAIN_CAP)
+                continue
+            if resp.status == 206 and not _content_range_starts_at_zero(resp):
+                last_exc = UpstreamError(f"206 for {full_path} has a missing/mismatched Content-Range (expected to start at byte 0): {resp.getheader('Content-Range')!r}")
                 resp.read(_DRAIN_CAP)
                 continue
             body = resp.read(max_response_bytes + 1)

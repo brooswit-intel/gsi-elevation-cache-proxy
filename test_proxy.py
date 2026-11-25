@@ -44,6 +44,15 @@ class FakeUpstream(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+        elif self.path == "/dem_png/14/500/500.png":
+            # 206 with the right length but a Content-Range offset that isn't 0 --
+            # the exact equal-length wrong-offset case from MINECRAFT-571 55866.
+            self.send_response(206)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(MINIMAL_PNG)))
+            self.send_header("Content-Range", f"bytes 20-{20 + len(MINIMAL_PNG) - 1}/10000")
+            self.end_headers()
+            self.wfile.write(MINIMAL_PNG)
         else:
             body = b"<Error><Code>NoSuchKey</Code></Error>"
             self.send_response(404)
@@ -139,6 +148,11 @@ class ProxyTest(unittest.TestCase):
         resp, _ = self._get("/dem_png/14/400/400.png")
         self.assertEqual(resp.status, 502)
         self.assertIsNone(self.proxy.cache.get("dem_png/14/400/400.png"))
+
+    def test_206_with_wrong_offset_content_range_is_rejected(self):
+        resp, _ = self._get("/dem_png/14/500/500.png")
+        self.assertEqual(resp.status, 502, "a 206 whose Content-Range doesn't start at 0 must never be trusted as this tile's own bytes")
+        self.assertIsNone(self.proxy.cache.get("dem_png/14/500/500.png"))
 
     def test_range_request_served_as_206_slice(self):
         self._get("/dem_png/14/100/100.png")
